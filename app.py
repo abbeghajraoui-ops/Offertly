@@ -29,10 +29,14 @@ except Exception:
 
 
 # =========================================================
-# OFFERTLY – FAS 13
-# Online-deployment utan domänkoppling
-# Bas: Fas 12
-# Fix: publik kundlänk online + Streamlit secrets + företagsbeskrivning i PDF
+# OFFERTLY – FAS 14
+# Stabilisering inför domän och försäljning
+# Bas: Fas 13
+# Nytt:
+# - AI-text visas innan sparning
+# - AI-text kan redigeras innan sparning
+# - Sparade offerter kan redigeras
+# - Uppdaterad data används i kundlänk, offert-PDF, kontrakt-PDF och faktura-PDF
 # Offert → kundgodkännande → kontrakt → faktura
 # =========================================================
 
@@ -321,6 +325,21 @@ def safe_json_loads(value: Any, fallback: Any) -> Any:
         return fallback
 
 
+def clean_ai_json(content: str) -> str:
+    text = safe_text(content).strip()
+
+    if text.startswith("```json"):
+        text = text.replace("```json", "", 1).strip()
+
+    if text.startswith("```"):
+        text = text.replace("```", "", 1).strip()
+
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    return text
+
+
 def generate_offer_number() -> str:
     stamp = datetime.datetime.now().strftime("%Y%m%d")
     short = uuid.uuid4().hex[:6].upper()
@@ -479,9 +498,9 @@ def get_scope_rows(price_rows: List[Dict[str, Any]]) -> List[str]:
     for row in price_rows:
         description = safe_text(row.get("description", "")).strip()
         unit_price = safe_float(row.get("unit_price", 0))
-        qty = safe_float(row.get("qty", 0))
+        row_type = safe_text(row.get("type", ""))
 
-        if description and unit_price <= 0 and qty <= 1:
+        if description and (unit_price <= 0 or row_type == "Omfattning"):
             scope.append(description)
 
     return scope
@@ -489,6 +508,26 @@ def get_scope_rows(price_rows: List[Dict[str, Any]]) -> List[str]:
 
 def get_priced_rows(price_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [row for row in price_rows if safe_float(row.get("unit_price", 0)) > 0]
+
+
+def scope_text_to_rows(scope_text: str) -> List[Dict[str, Any]]:
+    rows = []
+
+    for line in safe_text(scope_text).splitlines():
+        cleaned = line.strip().lstrip("-").lstrip("•").strip()
+
+        if cleaned:
+            rows.append(
+                {
+                    "description": cleaned,
+                    "type": "Omfattning",
+                    "qty": 1,
+                    "unit": "st",
+                    "unit_price": 0,
+                }
+            )
+
+    return rows
 
 
 def is_company_profile_ready(profile: Optional[Dict[str, Any]]) -> bool:
@@ -575,6 +614,69 @@ def build_offer_validation_errors(
         errors.append("ROT kan bara användas när arbetskostnad är större än 0 kr.")
 
     return errors
+
+
+def build_price_rows_from_simple_inputs(
+    scope_text: str,
+    labor_description: str,
+    labor_amount: float,
+    material_description: str,
+    material_amount: float,
+    other_description: str,
+    other_amount: float,
+) -> List[Dict[str, Any]]:
+    price_rows = []
+
+    price_rows.extend(scope_text_to_rows(scope_text))
+
+    if labor_amount > 0:
+        price_rows.append(
+            {
+                "description": labor_description.strip() or "Arbetskostnad enligt omfattning",
+                "type": "Arbete",
+                "qty": 1,
+                "unit": "st",
+                "unit_price": labor_amount,
+            }
+        )
+
+    if material_amount > 0:
+        price_rows.append(
+            {
+                "description": material_description.strip() or "Material",
+                "type": "Material",
+                "qty": 1,
+                "unit": "st",
+                "unit_price": material_amount,
+            }
+        )
+
+    if other_amount > 0:
+        price_rows.append(
+            {
+                "description": other_description.strip() or "Övriga kostnader",
+                "type": "Övrigt",
+                "qty": 1,
+                "unit": "st",
+                "unit_price": other_amount,
+            }
+        )
+
+    return price_rows
+
+
+def extract_row_by_type(price_rows: List[Dict[str, Any]], row_type: str) -> Dict[str, Any]:
+    for row in price_rows:
+        if safe_text(row.get("type")) == row_type and safe_float(row.get("unit_price")) > 0:
+            return row
+
+    return {
+        "description": "",
+        "type": row_type,
+        "qty": 1,
+        "unit": "st",
+        "unit_price": 0,
+    }
 
 
 # =========================================================
@@ -668,17 +770,6 @@ def fetch_offers(user_id: str) -> List[Dict[str, Any]]:
 
 
 def fetch_public_offer(public_token: str) -> Optional[Dict[str, Any]]:
-    """
-    Fas 13-fix:
-    get_public_offer_by_token(uuid) returnerar normalt:
-    {
-        "success": true,
-        "offer": {...},
-        "company_profile": {...}
-    }
-
-    Kundvyn ska använda data["offer"], inte hela data-paketet.
-    """
     try:
         res = supabase.rpc("get_public_offer_by_token", {"p_token": public_token}).execute()
 
@@ -835,7 +926,7 @@ Returnera JSON med exakt dessa nycklar:
             temperature=0.35,
         )
 
-        content = response.choices[0].message.content
+        content = clean_ai_json(response.choices[0].message.content)
         data = json.loads(content)
 
         return {
@@ -1703,7 +1794,7 @@ def render_overview(user: Dict[str, Any]):
         )
 
     with col_b:
-        st.markdown("### Inför online-deployment")
+        st.markdown("### Inför domän och försäljning")
 
         checks = [
             ("Supabase Auth fungerar", True),
@@ -1712,6 +1803,7 @@ def render_overview(user: Dict[str, Any]):
             ("Företagsprofil är komplett", is_company_profile_ready(profile)),
             ("PDF-flöde finns", True),
             ("Kundlänk finns", True),
+            ("Redigering av offert finns", True),
             ("Stripe kopplas senare", False),
         ]
 
@@ -1719,7 +1811,7 @@ def render_overview(user: Dict[str, Any]):
             if ok:
                 st.success(f"✓ {label}")
             else:
-                st.warning(f"Behöver ses över: {label}")
+                st.warning(f"Behöver ses över senare: {label}")
 
     if offers:
         st.markdown("### Senaste offerter")
@@ -1748,136 +1840,211 @@ def render_create_offer(user: Dict[str, Any]):
 
     render_profile_warning(company)
 
-    with st.form("create_offer_form"):
-        st.markdown("### 1. Kund")
+    st.markdown("### 1. Kund")
 
-        col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-        with col1:
-            customer_name = st.text_input("Kundens namn")
-            customer_email = st.text_input("Kundens e-post")
+    with col1:
+        customer_name = st.text_input("Kundens namn", key="create_customer_name")
+        customer_email = st.text_input("Kundens e-post", key="create_customer_email")
 
-        with col2:
-            customer_phone = st.text_input("Kundens telefon")
-            customer_address = st.text_input("Kundens adress")
+    with col2:
+        customer_phone = st.text_input("Kundens telefon", key="create_customer_phone")
+        customer_address = st.text_input("Kundens adress", key="create_customer_address")
 
-        st.markdown("### 2. Projekt")
+    st.markdown("### 2. Projekt")
 
-        col3, col4 = st.columns(2)
+    col3, col4 = st.columns(2)
 
-        with col3:
-            project_title = st.text_input("Projekttitel", placeholder="Ex: Badrumsrenovering i Malmö")
+    with col3:
+        project_title = st.text_input("Projekttitel", placeholder="Ex: Badrumsrenovering i Malmö", key="create_project_title")
 
-        with col4:
-            project_type = st.selectbox(
-                "Projekttyp",
-                [
-                    "Bygg",
-                    "VVS",
-                    "El",
-                    "Snickeri",
-                    "Målning",
-                    "Plattsättning",
-                    "Golv",
-                    "Tak",
-                    "Markarbete",
-                    "Annat",
-                ],
-            )
-
-        raw_project_description = st.text_area(
-            "Kort projektinformation till AI",
-            height=140,
-            placeholder=(
-                "Exempel: Kunden vill renovera badrum på ca 6 kvm. Rivning av befintligt ytskikt, "
-                "ny tätskiktslösning, kakel/klinker, montering av kommod, duschvägg och WC. "
-                "Material enligt överenskommelse."
-            ),
+    with col4:
+        project_type = st.selectbox(
+            "Projekttyp",
+            [
+                "Bygg",
+                "VVS",
+                "El",
+                "Snickeri",
+                "Målning",
+                "Plattsättning",
+                "Golv",
+                "Tak",
+                "Markarbete",
+                "Annat",
+            ],
+            key="create_project_type",
         )
 
-        use_ai = st.checkbox("Använd AI för att skapa professionell offerttext", value=True)
+    raw_project_description = st.text_area(
+        "Kort projektinformation till AI",
+        height=140,
+        placeholder=(
+            "Exempel: Kunden vill renovera badrum på ca 6 kvm. Rivning av befintligt ytskikt, "
+            "ny tätskiktslösning, kakel/klinker, montering av kommod, duschvägg och WC. "
+            "Material enligt överenskommelse."
+        ),
+        key="create_raw_project_description",
+    )
 
-        st.markdown("### 3. Prisrader")
-        st.caption("Arbete är ROT-grundande. Material och övrigt är inte ROT-grundande.")
+    st.markdown("### 3. AI-genererad offerttext")
+    st.caption("Generera texten först. Därefter kan du redigera den innan offerten sparas.")
 
-        col_price_1, col_price_2 = st.columns(2)
+    col_ai_1, col_ai_2 = st.columns([1, 1])
 
-        with col_price_1:
-            labor_description = st.text_input("Arbete – beskrivning", value="Arbetskostnad enligt omfattning")
-            material_description = st.text_input("Material – beskrivning", value="Material")
-            other_description = st.text_input("Övrigt – beskrivning", value="Övriga kostnader")
+    with col_ai_1:
+        use_ai = st.checkbox("Använd AI för att skapa professionell offerttext", value=True, key="create_use_ai")
 
-        with col_price_2:
-            labor_amount = st.number_input("Arbete exkl. moms", min_value=0.0, step=500.0, value=0.0)
-            material_amount = st.number_input("Material exkl. moms", min_value=0.0, step=500.0, value=0.0)
-            other_amount = st.number_input("Övrigt exkl. moms", min_value=0.0, step=250.0, value=0.0)
+    with col_ai_2:
+        generate_ai = st.button("Generera AI-text", type="primary", use_container_width=True)
 
-        include_rot = st.checkbox("Räkna med preliminärt ROT-avdrag på arbetskostnad", value=False)
+    if generate_ai:
+        errors_before_ai = []
 
-        preview_rows = []
+        if not customer_name.strip():
+            errors_before_ai.append("Fyll i kundens namn innan AI-text genereras.")
 
-        if labor_amount > 0:
-            preview_rows.append(
-                {
-                    "description": labor_description,
-                    "type": "Arbete",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": labor_amount,
+        if not project_title.strip():
+            errors_before_ai.append("Fyll i projekttitel innan AI-text genereras.")
+
+        if len(raw_project_description.strip()) < 20:
+            errors_before_ai.append("Skriv lite mer projektinformation innan AI-text genereras.")
+
+        if errors_before_ai:
+            st.error("AI-text kan inte genereras ännu.")
+            for err in errors_before_ai:
+                st.write(f"• {err}")
+        else:
+            if use_ai:
+                with st.spinner("AI skapar professionell offerttext..."):
+                    ai_data = generate_ai_offer_text(
+                        project_type=project_type,
+                        project_title=project_title,
+                        project_description=raw_project_description,
+                        customer_name=customer_name,
+                        company_profile=company,
+                    )
+            else:
+                ai_data = {
+                    "professional_description": raw_project_description,
+                    "scope": [],
+                    "terms": [],
+                    "customer_message": "",
                 }
-            )
 
-        if material_amount > 0:
-            preview_rows.append(
-                {
-                    "description": material_description,
-                    "type": "Material",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": material_amount,
-                }
-            )
+            default_terms = safe_text(company.get("default_terms") if company else "")
+            ai_terms = "\n".join(ai_data.get("terms", [])) or default_terms
 
-        if other_amount > 0:
-            preview_rows.append(
-                {
-                    "description": other_description,
-                    "type": "Övrigt",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": other_amount,
-                }
-            )
+            if not ai_terms:
+                ai_terms = (
+                    "Priset gäller enligt angiven omfattning.\n"
+                    "Eventuella tilläggsarbeten debiteras efter separat överenskommelse.\n"
+                    "Betalning sker enligt överenskommelse."
+                )
 
-        preview_totals = calculate_totals(preview_rows, include_rot=include_rot)
+            st.session_state["create_ai_description"] = ai_data.get("professional_description") or raw_project_description
+            st.session_state["create_ai_scope"] = "\n".join(ai_data.get("scope", []))
+            st.session_state["create_ai_terms"] = ai_terms
+            st.session_state["create_ai_customer_message"] = ai_data.get("customer_message", "")
 
-        st.markdown("### 4. Prisöversikt")
-        col_t1, col_t2, col_t3 = st.columns(3)
+            st.success("AI-texten är genererad. Kontrollera och redigera texten innan du sparar offerten.")
 
-        with col_t1:
-            st.metric("Summa exkl. moms", money(preview_totals["subtotal_ex_vat"]))
+    if "create_ai_description" not in st.session_state:
+        st.session_state["create_ai_description"] = ""
+    if "create_ai_scope" not in st.session_state:
+        st.session_state["create_ai_scope"] = ""
+    if "create_ai_terms" not in st.session_state:
+        st.session_state["create_ai_terms"] = ""
+    if "create_ai_customer_message" not in st.session_state:
+        st.session_state["create_ai_customer_message"] = ""
 
-        with col_t2:
-            st.metric("Moms 25 %", money(preview_totals["vat_amount"]))
+    ai_description = st.text_area(
+        "Redigerbar projektbeskrivning till offert/PDF/kundvy",
+        value=st.session_state.get("create_ai_description", ""),
+        height=160,
+        key="create_ai_description_editor",
+    )
 
-        with col_t3:
-            st.metric("Totalt inkl. moms", money(preview_totals["total_inc_vat"]))
+    ai_scope = st.text_area(
+        "Redigerbar arbetsomfattning – en rad per punkt",
+        value=st.session_state.get("create_ai_scope", ""),
+        height=150,
+        key="create_ai_scope_editor",
+    )
 
-        if include_rot:
-            st.info(
-                f"Preliminärt ROT-avdrag: {money(preview_totals['rot_deduction'])}. "
-                f"Att betala efter ROT: {money(preview_totals['total_after_rot'])}."
-            )
+    ai_terms = st.text_area(
+        "Redigerbara villkor",
+        value=st.session_state.get("create_ai_terms", ""),
+        height=150,
+        key="create_ai_terms_editor",
+    )
 
-        submitted = st.form_submit_button("Skapa och spara offert", type="primary", use_container_width=True)
+    ai_customer_message = st.text_area(
+        "Kundmeddelande / intern förhandsvisning",
+        value=st.session_state.get("create_ai_customer_message", ""),
+        height=100,
+        key="create_ai_customer_message_editor",
+    )
 
-    if submitted:
+    st.markdown("### 4. Prisrader")
+    st.caption("Arbete är ROT-grundande. Material och övrigt är inte ROT-grundande.")
+
+    col_price_1, col_price_2 = st.columns(2)
+
+    with col_price_1:
+        labor_description = st.text_input("Arbete – beskrivning", value="Arbetskostnad enligt omfattning", key="create_labor_description")
+        material_description = st.text_input("Material – beskrivning", value="Material", key="create_material_description")
+        other_description = st.text_input("Övrigt – beskrivning", value="Övriga kostnader", key="create_other_description")
+
+    with col_price_2:
+        labor_amount = st.number_input("Arbete exkl. moms", min_value=0.0, step=500.0, value=0.0, key="create_labor_amount")
+        material_amount = st.number_input("Material exkl. moms", min_value=0.0, step=500.0, value=0.0, key="create_material_amount")
+        other_amount = st.number_input("Övrigt exkl. moms", min_value=0.0, step=250.0, value=0.0, key="create_other_amount")
+
+    include_rot = st.checkbox("Räkna med preliminärt ROT-avdrag på arbetskostnad", value=False, key="create_include_rot")
+
+    preview_rows = build_price_rows_from_simple_inputs(
+        scope_text=ai_scope,
+        labor_description=labor_description,
+        labor_amount=labor_amount,
+        material_description=material_description,
+        material_amount=material_amount,
+        other_description=other_description,
+        other_amount=other_amount,
+    )
+
+    preview_totals = calculate_totals(preview_rows, include_rot=include_rot)
+
+    st.markdown("### 5. Prisöversikt")
+    col_t1, col_t2, col_t3 = st.columns(3)
+
+    with col_t1:
+        st.metric("Summa exkl. moms", money(preview_totals["subtotal_ex_vat"]))
+
+    with col_t2:
+        st.metric("Moms 25 %", money(preview_totals["vat_amount"]))
+
+    with col_t3:
+        st.metric("Totalt inkl. moms", money(preview_totals["total_inc_vat"]))
+
+    if include_rot:
+        st.info(
+            f"Preliminärt ROT-avdrag: {money(preview_totals['rot_deduction'])}. "
+            f"Att betala efter ROT: {money(preview_totals['total_after_rot'])}."
+        )
+
+    st.markdown("### 6. Spara offert")
+
+    if st.button("Skapa och spara offert", type="primary", use_container_width=True):
+        final_description = ai_description.strip() or raw_project_description.strip()
+
         errors = build_offer_validation_errors(
             customer_name=customer_name,
             customer_email=customer_email,
             customer_phone=customer_phone,
             project_title=project_title,
-            raw_project_description=raw_project_description,
+            raw_project_description=final_description,
             labor_amount=labor_amount,
             material_amount=material_amount,
             other_amount=other_amount,
@@ -1890,26 +2057,11 @@ def render_create_offer(user: Dict[str, Any]):
                 st.write(f"• {error}")
             return
 
-        ai_data = {
-            "professional_description": raw_project_description,
-            "scope": [],
-            "terms": [],
-            "customer_message": "",
-        }
+        if not ai_description.strip():
+            st.warning("AI-texten är tom. Generera eller skriv offerttext innan du sparar.")
+            return
 
-        if use_ai:
-            with st.spinner("AI skapar professionell offerttext..."):
-                ai_data = generate_ai_offer_text(
-                    project_type=project_type,
-                    project_title=project_title,
-                    project_description=raw_project_description,
-                    customer_name=customer_name,
-                    company_profile=company,
-                )
-
-        default_terms = safe_text(company.get("default_terms") if company else "")
-        ai_terms = "\n".join(ai_data.get("terms", []))
-        terms = ai_terms or default_terms
+        terms = ai_terms.strip()
 
         if not terms:
             terms = (
@@ -1918,52 +2070,15 @@ def render_create_offer(user: Dict[str, Any]):
                 "Betalning sker enligt överenskommelse."
             )
 
-        price_rows = []
-
-        for scope_item in ai_data.get("scope", []):
-            if safe_text(scope_item).strip():
-                price_rows.append(
-                    {
-                        "description": safe_text(scope_item).strip(),
-                        "type": "Omfattning",
-                        "qty": 1,
-                        "unit": "st",
-                        "unit_price": 0,
-                    }
-                )
-
-        if labor_amount > 0:
-            price_rows.append(
-                {
-                    "description": labor_description,
-                    "type": "Arbete",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": labor_amount,
-                }
-            )
-
-        if material_amount > 0:
-            price_rows.append(
-                {
-                    "description": material_description,
-                    "type": "Material",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": material_amount,
-                }
-            )
-
-        if other_amount > 0:
-            price_rows.append(
-                {
-                    "description": other_description,
-                    "type": "Övrigt",
-                    "qty": 1,
-                    "unit": "st",
-                    "unit_price": other_amount,
-                }
-            )
+        price_rows = build_price_rows_from_simple_inputs(
+            scope_text=ai_scope,
+            labor_description=labor_description,
+            labor_amount=labor_amount,
+            material_description=material_description,
+            material_amount=material_amount,
+            other_description=other_description,
+            other_amount=other_amount,
+        )
 
         totals = calculate_totals(price_rows, include_rot=include_rot)
 
@@ -1974,7 +2089,7 @@ def render_create_offer(user: Dict[str, Any]):
             "customer_address": customer_address.strip(),
             "project_title": project_title.strip(),
             "project_type": project_type,
-            "project_description": ai_data.get("professional_description") or raw_project_description,
+            "project_description": final_description,
             "price_rows": price_rows,
             "subtotal_ex_vat": totals["subtotal_ex_vat"],
             "vat_amount": totals["vat_amount"],
@@ -1990,6 +2105,11 @@ def render_create_offer(user: Dict[str, Any]):
         try:
             created = create_offer(user["id"], payload)
             st.success("Offerten är sparad.")
+
+            st.session_state["create_ai_description"] = ""
+            st.session_state["create_ai_scope"] = ""
+            st.session_state["create_ai_terms"] = ""
+            st.session_state["create_ai_customer_message"] = ""
 
             if created and created.get("public_token"):
                 st.write("Kundlänk:")
@@ -2115,6 +2235,225 @@ def render_company_profile(user: Dict[str, Any]):
             st.error(f"Kunde inte spara företagsprofilen: {e}")
 
 
+def render_edit_offer_form(offer: Dict[str, Any], user: Dict[str, Any]):
+    offer_id = safe_text(offer.get("id"))
+    price_rows = normalize_price_rows(offer.get("price_rows"))
+    scope_rows = get_scope_rows(price_rows)
+
+    labor_row = extract_row_by_type(price_rows, "Arbete")
+    material_row = extract_row_by_type(price_rows, "Material")
+    other_row = extract_row_by_type(price_rows, "Övrigt")
+
+    existing_rot = safe_float(offer.get("rot_deduction")) > 0
+
+    st.markdown("### Redigera offert")
+    st.caption("Ändringar sparas till Supabase och används direkt i kundlänk, offert-PDF, kontrakt-PDF och faktura-PDF.")
+
+    with st.form(f"edit_offer_form_{offer_id}"):
+        st.markdown("#### Kund")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            customer_name = st.text_input("Kundens namn", value=safe_text(offer.get("customer_name")), key=f"edit_customer_name_{offer_id}")
+            customer_email = st.text_input("Kundens e-post", value=safe_text(offer.get("customer_email")), key=f"edit_customer_email_{offer_id}")
+
+        with col2:
+            customer_phone = st.text_input("Kundens telefon", value=safe_text(offer.get("customer_phone")), key=f"edit_customer_phone_{offer_id}")
+            customer_address = st.text_input("Kundens adress", value=safe_text(offer.get("customer_address")), key=f"edit_customer_address_{offer_id}")
+
+        st.markdown("#### Projekt och offerttext")
+
+        project_types = [
+            "Bygg",
+            "VVS",
+            "El",
+            "Snickeri",
+            "Målning",
+            "Plattsättning",
+            "Golv",
+            "Tak",
+            "Markarbete",
+            "Annat",
+        ]
+
+        existing_project_type = safe_text(offer.get("project_type") or "Bygg")
+        project_type_index = project_types.index(existing_project_type) if existing_project_type in project_types else 0
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            project_title = st.text_input("Projekttitel", value=safe_text(offer.get("project_title")), key=f"edit_project_title_{offer_id}")
+
+        with col4:
+            project_type = st.selectbox(
+                "Projekttyp",
+                project_types,
+                index=project_type_index,
+                key=f"edit_project_type_{offer_id}",
+            )
+
+        project_description = st.text_area(
+            "Projektbeskrivning / offerttext",
+            value=safe_text(offer.get("project_description")),
+            height=170,
+            key=f"edit_project_description_{offer_id}",
+        )
+
+        scope_text = st.text_area(
+            "Arbetsomfattning – en rad per punkt",
+            value="\n".join(scope_rows),
+            height=150,
+            key=f"edit_scope_{offer_id}",
+        )
+
+        terms = st.text_area(
+            "Villkor",
+            value=safe_text(offer.get("terms")),
+            height=150,
+            key=f"edit_terms_{offer_id}",
+        )
+
+        st.markdown("#### Prisrader")
+
+        col_price_1, col_price_2 = st.columns(2)
+
+        with col_price_1:
+            labor_description = st.text_input(
+                "Arbete – beskrivning",
+                value=safe_text(labor_row.get("description")) or "Arbetskostnad enligt omfattning",
+                key=f"edit_labor_description_{offer_id}",
+            )
+            material_description = st.text_input(
+                "Material – beskrivning",
+                value=safe_text(material_row.get("description")) or "Material",
+                key=f"edit_material_description_{offer_id}",
+            )
+            other_description = st.text_input(
+                "Övrigt – beskrivning",
+                value=safe_text(other_row.get("description")) or "Övriga kostnader",
+                key=f"edit_other_description_{offer_id}",
+            )
+
+        with col_price_2:
+            labor_amount = st.number_input(
+                "Arbete exkl. moms",
+                min_value=0.0,
+                step=500.0,
+                value=safe_float(labor_row.get("unit_price")),
+                key=f"edit_labor_amount_{offer_id}",
+            )
+            material_amount = st.number_input(
+                "Material exkl. moms",
+                min_value=0.0,
+                step=500.0,
+                value=safe_float(material_row.get("unit_price")),
+                key=f"edit_material_amount_{offer_id}",
+            )
+            other_amount = st.number_input(
+                "Övrigt exkl. moms",
+                min_value=0.0,
+                step=250.0,
+                value=safe_float(other_row.get("unit_price")),
+                key=f"edit_other_amount_{offer_id}",
+            )
+
+        include_rot = st.checkbox(
+            "Räkna med preliminärt ROT-avdrag på arbetskostnad",
+            value=existing_rot,
+            key=f"edit_include_rot_{offer_id}",
+        )
+
+        updated_rows_preview = build_price_rows_from_simple_inputs(
+            scope_text=scope_text,
+            labor_description=labor_description,
+            labor_amount=labor_amount,
+            material_description=material_description,
+            material_amount=material_amount,
+            other_description=other_description,
+            other_amount=other_amount,
+        )
+
+        updated_totals_preview = calculate_totals(updated_rows_preview, include_rot=include_rot)
+
+        st.markdown("#### Ny prisöversikt")
+        col_t1, col_t2, col_t3 = st.columns(3)
+
+        with col_t1:
+            st.metric("Summa exkl. moms", money(updated_totals_preview["subtotal_ex_vat"]))
+
+        with col_t2:
+            st.metric("Moms 25 %", money(updated_totals_preview["vat_amount"]))
+
+        with col_t3:
+            st.metric("Totalt inkl. moms", money(updated_totals_preview["total_inc_vat"]))
+
+        if include_rot:
+            st.info(
+                f"Preliminärt ROT-avdrag: {money(updated_totals_preview['rot_deduction'])}. "
+                f"Att betala efter ROT: {money(updated_totals_preview['total_after_rot'])}."
+            )
+
+        submitted = st.form_submit_button("Spara ändringar i offert", type="primary", use_container_width=True)
+
+    if submitted:
+        errors = build_offer_validation_errors(
+            customer_name=customer_name,
+            customer_email=customer_email,
+            customer_phone=customer_phone,
+            project_title=project_title,
+            raw_project_description=project_description,
+            labor_amount=labor_amount,
+            material_amount=material_amount,
+            other_amount=other_amount,
+            include_rot=include_rot,
+        )
+
+        if errors:
+            st.error("Offerten kan inte uppdateras ännu.")
+            for error in errors:
+                st.write(f"• {error}")
+            return
+
+        updated_rows = build_price_rows_from_simple_inputs(
+            scope_text=scope_text,
+            labor_description=labor_description,
+            labor_amount=labor_amount,
+            material_description=material_description,
+            material_amount=material_amount,
+            other_description=other_description,
+            other_amount=other_amount,
+        )
+
+        updated_totals = calculate_totals(updated_rows, include_rot=include_rot)
+
+        payload = {
+            "customer_name": customer_name.strip(),
+            "customer_email": customer_email.strip(),
+            "customer_phone": customer_phone.strip(),
+            "customer_address": customer_address.strip(),
+            "project_title": project_title.strip(),
+            "project_type": project_type,
+            "project_description": project_description.strip(),
+            "price_rows": updated_rows,
+            "subtotal_ex_vat": updated_totals["subtotal_ex_vat"],
+            "vat_amount": updated_totals["vat_amount"],
+            "total_inc_vat": updated_totals["total_inc_vat"],
+            "labor_total_inc_vat": updated_totals["labor_total_inc_vat"],
+            "rot_deduction": updated_totals["rot_deduction"],
+            "total_after_rot": updated_totals["total_after_rot"],
+            "terms": terms.strip(),
+        }
+
+        try:
+            update_offer(offer_id, user["id"], payload)
+            st.success("Offerten är uppdaterad.")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Kunde inte uppdatera offerten: {e}")
+
+
 def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Optional[Dict[str, Any]]):
     offer_id = safe_text(offer.get("id"))
     status = safe_text(offer.get("status") or "draft")
@@ -2153,7 +2492,7 @@ def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Opti
             with st.expander("Visa kundlänk"):
                 st.code(get_public_link(public_token))
 
-        tabs = st.tabs(["Offert", "Kontrakt", "Faktura", "Admin"])
+        tabs = st.tabs(["Offert", "Redigera", "Kontrakt", "Faktura", "Admin"])
 
         with tabs[0]:
             col_a, col_b = st.columns(2)
@@ -2192,6 +2531,9 @@ def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Opti
                     st.info("Offerten är redan skickad eller längre fram i flödet.")
 
         with tabs[1]:
+            render_edit_offer_form(offer, user)
+
+        with tabs[2]:
             allowed_for_contract = status in ["approved", "signed_with_bankid", "contract_created", "invoiced"]
 
             if not allowed_for_contract:
@@ -2236,7 +2578,7 @@ def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Opti
                         key=f"download_contract_pdf_{offer_id}",
                     )
 
-        with tabs[2]:
+        with tabs[3]:
             allowed_for_invoice = status in ["contract_created", "invoiced"]
 
             if not offer.get("contract_id"):
@@ -2288,7 +2630,7 @@ def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Opti
                         key=f"download_invoice_pdf_{offer_id}",
                     )
 
-        with tabs[3]:
+        with tabs[4]:
             st.warning("Adminläget är till för intern hantering och testning. Använd det försiktigt.")
 
             statuses = ["draft", "sent", "approved", "signed_with_bankid", "contract_created", "invoiced"]
@@ -2369,7 +2711,7 @@ def render_offer_card(offer: Dict[str, Any], user: Dict[str, Any], company: Opti
 
 def render_saved_offers(user: Dict[str, Any]):
     st.markdown("## Sparade offerter")
-    st.caption("Här hanterar du offert, kundlänk, kontrakt och faktura.")
+    st.caption("Här hanterar du offert, redigering, kundlänk, kontrakt och faktura.")
 
     company = fetch_company_profile(user["id"])
     offers = fetch_offers(user["id"])
