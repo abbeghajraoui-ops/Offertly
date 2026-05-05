@@ -29,8 +29,10 @@ except Exception:
 
 
 # =========================================================
-# OFFERTLY – FAS 12
-# Produktfinish inför online-deployment
+# OFFERTLY – FAS 13
+# Online-deployment utan domänkoppling
+# Bas: Fas 12
+# Fix: publik kundlänk online + Streamlit secrets + företagsbeskrivning i PDF
 # Offert → kundgodkännande → kontrakt → faktura
 # =========================================================
 
@@ -48,14 +50,24 @@ st.set_page_config(
 # CONFIG
 # =========================================================
 
-VAT_RATE = 0.25
-ROT_RATE = float(os.getenv("ROT_RATE", "0.30"))
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
 
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8501").rstrip("/")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    return os.getenv(name, default)
+
+
+VAT_RATE = 0.25
+ROT_RATE = float(get_secret("ROT_RATE", "0.30"))
+
+APP_BASE_URL = get_secret("APP_BASE_URL", "http://localhost:8501").rstrip("/")
+SUPABASE_URL = get_secret("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY", "")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")
+OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 
 # =========================================================
@@ -572,7 +584,7 @@ def build_offer_validation_errors(
 @st.cache_resource
 def get_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        st.error("Supabase saknas i .env. Kontrollera SUPABASE_URL och SUPABASE_ANON_KEY.")
+        st.error("Supabase saknas. Kontrollera SUPABASE_URL och SUPABASE_ANON_KEY i .env lokalt eller Streamlit secrets online.")
         st.stop()
 
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -656,13 +668,33 @@ def fetch_offers(user_id: str) -> List[Dict[str, Any]]:
 
 
 def fetch_public_offer(public_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Fas 13-fix:
+    get_public_offer_by_token(uuid) returnerar normalt:
+    {
+        "success": true,
+        "offer": {...},
+        "company_profile": {...}
+    }
+
+    Kundvyn ska använda data["offer"], inte hela data-paketet.
+    """
     try:
         res = supabase.rpc("get_public_offer_by_token", {"p_token": public_token}).execute()
 
         if res.data:
-            if isinstance(res.data, list):
-                return res.data[0]
-            return res.data
+            data = res.data[0] if isinstance(res.data, list) else res.data
+
+            if isinstance(data, dict) and "offer" in data:
+                offer = data.get("offer") or {}
+                company_profile = data.get("company_profile") or {}
+
+                if isinstance(offer, dict):
+                    offer["_company_profile"] = company_profile if isinstance(company_profile, dict) else {}
+                    return offer
+
+            if isinstance(data, dict):
+                return data
 
     except Exception:
         pass
@@ -930,6 +962,14 @@ def add_pdf_header(elements, styles, document_type: str, company: Optional[Dict[
     elements.append(Spacer(1, 12))
 
 
+def add_company_description_to_pdf(elements, styles, company: Optional[Dict[str, Any]]):
+    description = safe_text(company.get("company_description") if company else "").strip()
+
+    if description:
+        elements.append(Paragraph("Om företaget", styles["OffertlyH2"]))
+        elements.append(Paragraph(pdf_text(description), styles["OffertlyBody"]))
+
+
 def add_pdf_footer_note(elements, styles, text: str):
     elements.append(Spacer(1, 16))
     elements.append(Paragraph(pdf_text(text), styles["OffertlySmall"]))
@@ -1070,6 +1110,8 @@ def build_offer_pdf(offer: Dict[str, Any], company: Optional[Dict[str, Any]]) ->
     elements.append(Paragraph(f"Status: {pdf_text(status_label(safe_text(offer.get('status'))))}", styles["OffertlySmall"]))
     elements.append(Spacer(1, 10))
 
+    add_company_description_to_pdf(elements, styles, company)
+
     elements.append(Paragraph("Kunduppgifter", styles["OffertlyH2"]))
     elements.append(customer_table(offer, styles))
 
@@ -1139,6 +1181,8 @@ def build_contract_pdf(offer: Dict[str, Any], company: Optional[Dict[str, Any]])
     add_pdf_header(elements, styles, "KONTRAKT / AVTAL", company, contract_id)
 
     elements.append(Paragraph(pdf_text(offer.get("project_title") or "Kontrakt"), styles["OffertlyTitle"]))
+
+    add_company_description_to_pdf(elements, styles, company)
 
     meta = [
         ["Offertnummer", pdf_text(offer.get("offer_number"))],
@@ -1355,11 +1399,13 @@ def render_public_offer(public_token: str):
         st.error("Offerten kunde inte hittas.")
         return
 
-    company = None
-    user_id = offer.get("user_id")
+    company = offer.get("_company_profile") if isinstance(offer.get("_company_profile"), dict) else None
 
-    if user_id:
-        company = fetch_company_profile(user_id)
+    if not company:
+        user_id = offer.get("user_id")
+
+        if user_id:
+            company = fetch_company_profile(user_id)
 
     price_rows = normalize_price_rows(offer.get("price_rows"))
     scope_rows = get_scope_rows(price_rows)
@@ -1372,8 +1418,8 @@ def render_public_offer(public_token: str):
     st.markdown(
         f"""
         <div class="public-header">
-            <h1>Offert från {company_name}</h1>
-            <p>{company_description}</p>
+            <h1>Offert från {escape(company_name)}</h1>
+            <p>{escape(company_description)}</p>
         </div>
         """,
         unsafe_allow_html=True,
